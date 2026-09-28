@@ -1,0 +1,4 @@
+name: hermes-teams-inbox
+version: "1.0.0"
+description: "Hermes Desktop pane for Microsoft Teams via Graph (Azure CLI token)."
+author: SMF Works
