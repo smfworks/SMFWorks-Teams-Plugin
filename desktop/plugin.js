@@ -1,7 +1,8 @@
 /**
  * Hermes Desktop — Microsoft Teams (SMF Works).
  * Folder name must equal id (`hermes-teams-inbox`).
- * Roster: Graph via Azure CLI. Conversation: Teams web client in-pane.
+ * Roster: localhost Graph proxy (Azure CLI token + per-install secret, POST body).
+ * Conversation: Teams web client in-pane.
  * Channel message reads need ChannelMessage.Read.All, which `az` does not have.
  */
 import {
@@ -27,14 +28,14 @@ import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const TEAMS_HOME = 'https://teams.cloud.microsoft/v2/'
-const TEAMS_HOSTS = new Set([
-  'teams.cloud.microsoft',
+const TEAMS_WEB_HOSTS = [
   'teams.microsoft.com',
   'teams.microsoft.us',
   'gov.teams.microsoft.us',
-  'login.microsoftonline.com',
-  'login.microsoft.com'
-])
+  'teams.live.com',
+  'teams.cloud.microsoft'
+]
+const LOGIN_HOSTS = new Set(['login.microsoftonline.com', 'login.microsoft.com'])
 const CHROME_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
@@ -42,9 +43,38 @@ const ID = 'hermes-teams-inbox'
 const ROUTE = '/teams'
 
 let pluginCtx = null
+let secretCache = ''
+
+function isTeamsHost(host) {
+  return TEAMS_WEB_HOSTS.some((name) => host === name || host.endsWith('.' + name))
+}
+
+function isAllowedTeamsUrl(url) {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'https:') return false
+    if (parsed.username || parsed.password) return false
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, '')
+    return isTeamsHost(host)
+  } catch {
+    return false
+  }
+}
+
+function isAllowedWebviewUrl(url) {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'https:') return false
+    if (parsed.username || parsed.password) return false
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, '')
+    return isTeamsHost(host) || LOGIN_HOSTS.has(host)
+  } catch {
+    return false
+  }
+}
 
 function openUrl(url) {
-  if (!url) return
+  if (!isAllowedTeamsUrl(url)) return
   const opener = pluginCtx?.os?.openExternal
   if (typeof opener === 'function') {
     void opener(url)
@@ -72,11 +102,13 @@ function webClientUrl(url) {
 }
 
 function followUrl(url) {
-  if (!url) return null
+  if (!isAllowedWebviewUrl(url)) return null
   try {
     const parsed = new URL(url)
-    if (parsed.protocol !== 'https:') return null
-    if (TEAMS_HOSTS.has(parsed.hostname) && isLauncherPath(parsed.pathname)) return TEAMS_HOME
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, '')
+    // Picker buttons call window.open. Follow Teams and sign-in URLs in this
+    // pane. Anything else stays out of the persistent partition.
+    if (isTeamsHost(host) && isLauncherPath(parsed.pathname)) return TEAMS_HOME
     return parsed.toString()
   } catch {
     return null
@@ -84,12 +116,9 @@ function followUrl(url) {
 }
 
 function teamsUrl(url) {
-  if (!url) return null
+  if (!isAllowedWebviewUrl(url)) return null
   try {
-    const parsed = new URL(url)
-    if (parsed.protocol !== 'https:') return null
-    if (!TEAMS_HOSTS.has(parsed.hostname)) return null
-    return parsed.toString()
+    return new URL(url).toString()
   } catch {
     return null
   }
@@ -111,13 +140,104 @@ function dismissAppGate(webview) {
   }
 }
 
+function joinPath(root, ...parts) {
+  const slash = String(root).includes('\\') ? '\\' : '/'
+  const pieces = [String(root).replace(/[\\/]+$/, '')]
+  for (const part of parts) {
+    pieces.push(String(part).replace(/^[\\/]+|[\\/]+$/g, ''))
+  }
+  return pieces.join(slash)
+}
+
+async function resolvePluginRoot(bridge) {
+  if (typeof bridge.agentPluginsRoot === 'function') {
+    try {
+      const root = await bridge.agentPluginsRoot()
+      if (root) return String(root)
+    } catch {
+      // Typed on the desktop bridge, but current preload builds do not bind it.
+    }
+  }
+  // logsRoot is the implemented twin: same profile home, final segment "logs".
+  // Agent plugins live in the sibling "plugins" directory.
+  if (typeof bridge.logsRoot !== 'function') return ''
+  try {
+    const logs = String((await bridge.logsRoot()) || '')
+    const parts = logs.split(/[/\\]/)
+    if (!parts.length || parts[parts.length - 1].toLowerCase() !== 'logs') return ''
+    const slash = logs.includes('\\') ? '\\' : '/'
+    parts[parts.length - 1] = 'plugins'
+    return parts.join(slash)
+  } catch {
+    return ''
+  }
+}
+
+async function readInstalledSecret() {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop : null
+  if (!bridge || typeof bridge.readFileText !== 'function') return ''
+  const root = await resolvePluginRoot(bridge)
+  if (!root) return ''
+  try {
+    const result = await bridge.readFileText(joinPath(root, ID, 'proxy.secret'))
+    const text = String(result?.text || '').trim()
+    if (!text || result?.truncated) return ''
+    return text.split(/\s+/)[0]
+  } catch {
+    return ''
+  }
+}
+
+async function ensureSecret(force) {
+  if (secretCache && !force) return secretCache
+  const secret = await readInstalledSecret()
+  secretCache = secret || ''
+  return secretCache
+}
+
 async function rest(path) {
   if (!pluginCtx?.rest) {
     const err = new Error('backend-off')
     err.backend = false
     throw err
   }
-  return pluginCtx.rest(path)
+  let secret = await ensureSecret(false)
+  if (!secret) {
+    // A rejected local call creates the secret file. It is not in the response.
+    let probeError = null
+    try {
+      await pluginCtx.rest(path)
+    } catch (err) {
+      probeError = err
+    }
+    secret = await ensureSecret(true)
+    if (!secret) {
+      const probeMessage = String(probeError?.message || '')
+      if (probeError && !/401|unauthorized/i.test(probeMessage)) {
+        throw probeError
+      }
+      const err = new Error('proxy-secret-unavailable')
+      throw err
+    }
+  }
+  // pluginCtx.rest accepts method and body, not custom headers. The host
+  // JSON-encodes the body, so the secret is not part of the request line.
+  const send = (value) =>
+    pluginCtx.rest(path, {
+      method: 'POST',
+      body: { proxy_secret: value }
+    })
+  try {
+    return await send(secret)
+  } catch (err) {
+    secretCache = ''
+    const fresh = await readInstalledSecret()
+    if (fresh && fresh !== secret) {
+      secretCache = fresh
+      return send(fresh)
+    }
+    throw err
+  }
 }
 
 function TeamsEmbed({ url }) {
@@ -175,7 +295,11 @@ function TeamsEmbed({ url }) {
       const next = event.url
       if (!next) return
       const target = webClientUrl(next)
-      if (!target || target === next) return
+      if (!target) {
+        event.preventDefault()
+        return
+      }
+      if (target === next) return
       event.preventDefault()
       go(target)
     }
@@ -308,9 +432,14 @@ function TeamsPage() {
   if (status.isError || status.data?.ok === false) {
     const message = String(status.error?.message || '')
     const backendOff = message === 'backend-off' || /Plugin not found/.test(message)
+    const secretMissing = message === 'proxy-secret-unavailable'
     return jsx(ErrorState, {
       title: backendOff ? t('backendError') : t('authError'),
-      description: backendOff ? t('backendHint') : status.data?.hint || status.data?.error || message,
+      description: backendOff
+        ? t('backendHint')
+        : secretMissing
+          ? t('proxySecretHint')
+          : status.data?.hint || status.data?.error || message,
       action: jsx(Button, {
         size: 'sm',
         onClick: () => {
@@ -489,6 +618,8 @@ export default {
         backendError: 'Teams backend is off',
         backendHint: 'This profile has not enabled hermes-teams-inbox. Enable it in that profile and restart the backend.',
         authError: 'Graph sign-in needed',
+        proxySecretHint:
+          'The Teams proxy secret was not readable. It is created on first backend start at <HERMES_HOME>/plugins/hermes-teams-inbox/proxy.secret (mode 0600). Reload Desktop after az login.',
         chipTip: 'Microsoft Teams inbox'
       }
     })
